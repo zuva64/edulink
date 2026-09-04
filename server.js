@@ -1,127 +1,28 @@
-const http = require('node:http');
-const fs = require('node:fs');
-const path = require('node:path');
-const crypto = require('node:crypto');
-const { DatabaseSync } = require('node:sqlite');
-
-const port = Number(process.env.PORT || 8000);
-const root = __dirname;
-const sessions = new Map();
-const db = new DatabaseSync(path.join(root, 'edulink.sqlite'));
-
-db.exec(`
-CREATE TABLE IF NOT EXISTS accounts (
-  id INTEGER PRIMARY KEY,
-  name TEXT NOT NULL,
-  email TEXT UNIQUE NOT NULL,
-  role TEXT NOT NULL,
-  status TEXT NOT NULL,
-  last_login TEXT NOT NULL,
-  password_hash TEXT NOT NULL,
-  password_salt TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS teacher_profiles (
-  account_id INTEGER PRIMARY KEY,
-  department TEXT,
-  position TEXT,
-  phone TEXT,
-  FOREIGN KEY(account_id) REFERENCES accounts(id)
-);
-CREATE TABLE IF NOT EXISTS student_profiles (
-  account_id INTEGER PRIMARY KEY,
-  student_number TEXT,
-  group_name TEXT,
-  FOREIGN KEY(account_id) REFERENCES accounts(id)
-);
-CREATE TABLE IF NOT EXISTS courses (
-  id INTEGER PRIMARY KEY,
-  code TEXT UNIQUE NOT NULL,
-  name TEXT NOT NULL,
-  description TEXT
-);
-CREATE TABLE IF NOT EXISTS lessons (
-  id INTEGER PRIMARY KEY,
-  course_id INTEGER NOT NULL,
-  teacher_id INTEGER NOT NULL,
-  group_name TEXT NOT NULL,
-  title TEXT NOT NULL,
-  starts_at TEXT NOT NULL,
-  ends_at TEXT NOT NULL,
-  status TEXT NOT NULL,
-  video_room_id TEXT NOT NULL,
-  FOREIGN KEY(course_id) REFERENCES courses(id),
-  FOREIGN KEY(teacher_id) REFERENCES accounts(id)
-);
-`);
-
-function hashPassword(password, salt) { return crypto.scryptSync(password, salt, 64).toString('hex'); }
-function seedAccount(id, name, email, role, password, status = 'Активен') {
-  const salt = `${email}-salt`;
-  db.prepare('INSERT OR IGNORE INTO accounts (id,name,email,role,status,last_login,password_hash,password_salt) VALUES (?,?,?,?,?,?,?,?)')
-    .run(id, name, email, role, status, 'Сегодня', hashPassword(password, salt), salt);
-}
-seedAccount(1, 'Анна Крылова', 'anna.krylova@edulink.local', 'Преподаватель', process.env.TEACHER_PASSWORD || 'TeacherDemo123!');
-seedAccount(2, 'Алексей Морозов', process.env.ADMIN_EMAIL || 'admin@edulink.local', 'Администратор', process.env.ADMIN_PASSWORD || 'ChangeMe123!');
-seedAccount(3, 'Елена Смирнова', 'elena.smirnova@edulink.local', 'Студент', process.env.STUDENT_PASSWORD || 'StudentDemo123!');
-seedAccount(4, 'Мария Волкова', 'maria.volkova@edulink.local', 'Преподаватель', 'TeacherDemo123!');
-seedAccount(5, 'Илья Петров', 'ilya.petrov@edulink.local', 'Студент', 'StudentDemo123!', 'Ожидает активации');
-db.prepare('INSERT OR IGNORE INTO teacher_profiles (account_id,department,position,phone) VALUES (1,?,?,?)').run('Кафедра терапии', 'Доцент', '+7 (999) 123-45-67');
-db.prepare('INSERT OR IGNORE INTO student_profiles (account_id,student_number,group_name) VALUES (3,?,?)').run('ST-0003', 'МЕД-21-01');
-db.prepare('INSERT OR IGNORE INTO courses (id,code,name,description) VALUES (1,?,?,?)').run('MED101', 'Основы клинического мышления', 'Учебный курс с очными и онлайн-занятиями.');
-db.prepare('INSERT OR IGNORE INTO lessons (id,course_id,teacher_id,group_name,title,starts_at,ends_at,status,video_room_id) VALUES (1,1,1,?,?,?,?,?,?)')
-  .run('МЕД-21-01', 'Разбор клинического случая', new Date(Date.now()+15*60*1000).toISOString(), new Date(Date.now()+75*60*1000).toISOString(), 'Запланировано', 'lesson-1');
-
-const videoRoom = { active: false, teacherJoined: false, studentJoined: false, startedAt: null, revision: 0 };
-const videoSignals = { teacher: [], student: [] };
-let nextSignalId = 1;
-
-function sendJson(response, status, body, headers = {}) { response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', ...headers }); response.end(JSON.stringify(body)); }
-function parseCookies(request) { return Object.fromEntries((request.headers.cookie || '').split(';').filter(Boolean).map((item) => item.trim().split('='))); }
-function currentSession(request) { const token = parseCookies(request).edulink_session; return token && sessions.get(token); }
-function readBody(request) { return new Promise((resolve, reject) => { let body=''; request.on('data', c => { body += c; if (body.length > 100000) request.destroy(); }); request.on('end', () => { try { resolve(JSON.parse(body || '{}')); } catch (e) { reject(e); } }); request.on('error', reject); }); }
-function safeEqual(a,b) { const x=Buffer.from(a); const y=Buffer.from(b); return x.length===y.length && crypto.timingSafeEqual(x,y); }
-function roleCode(role) { return role === 'Администратор' ? 'admin' : role === 'Преподаватель' ? 'teacher' : role === 'Студент' ? 'student' : 'staff'; }
-function requireRole(request, response, roles) { const session=currentSession(request); if (!session || !roles.includes(session.role)) { sendJson(response, 403, { error:'Недостаточно прав' }); return null; } return session; }
-function serveStatic(request,response) { const url=request.url.split('?')[0]; const requested=url==='/'?'/index.html':url; const filePath=path.normalize(path.join(root,requested)); if(!filePath.startsWith(root)||!fs.existsSync(filePath)||fs.statSync(filePath).isDirectory()) return sendJson(response,404,{error:'Не найдено'}); const types={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8'}; response.writeHead(200,{'Content-Type':types[path.extname(filePath)]||'application/octet-stream'}); fs.createReadStream(filePath).pipe(response); }
-function iceServers() { const stun=String(process.env.STUN_URLS||'stun:stun.l.google.com:19302').split(',').map(v=>v.trim()).filter(Boolean); const result=[{urls:stun.length===1?stun[0]:stun}]; const turn=String(process.env.TURN_URLS||process.env.TURN_URL||'').split(',').map(v=>v.trim()).filter(Boolean); if(turn.length) result.push({urls:turn.length===1?turn[0]:turn,username:process.env.TURN_USERNAME||'',credential:process.env.TURN_CREDENTIAL||''}); return result; }
-
-const server=http.createServer(async (request,response)=>{
-  try {
-    if(request.method==='POST'&&request.url==='/api/login'){
-      const body=await readBody(request); const email=String(body.email||'').toLowerCase(); const account=db.prepare('SELECT * FROM accounts WHERE lower(email)=?').get(email);
-      if(!account||!safeEqual(hashPassword(String(body.password||''),account.password_salt),account.password_hash)) return sendJson(response,401,{error:'Неверный email или пароль'});
-      if(account.status==='Заблокирован') return sendJson(response,403,{error:'Учетная запись заблокирована'});
-      const token=crypto.randomBytes(32).toString('hex'); const role=roleCode(account.role); sessions.set(token,{accountId:account.id,email:account.email,role});
-      return sendJson(response,200,{email:account.email,role},{'Set-Cookie':`edulink_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=28800`});
-    }
-    if(request.method==='POST'&&request.url==='/api/logout'){ const token=parseCookies(request).edulink_session; if(token) sessions.delete(token); return sendJson(response,200,{ok:true},{'Set-Cookie':'edulink_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0'}); }
-    if(request.method==='GET'&&request.url==='/api/session'){ const s=currentSession(request); return s?sendJson(response,200,{email:s.email,role:s.role}):sendJson(response,401,{error:'Требуется авторизация'}); }
-    if(request.method==='GET'&&request.url==='/api/users'){ if(!requireRole(request,response,['admin'])) return; return sendJson(response,200,db.prepare('SELECT id,name,email,role,status,last_login AS lastLogin FROM accounts ORDER BY id').all()); }
-    if(request.method==='POST'&&request.url==='/api/users'){ if(!requireRole(request,response,['admin'])) return; const b=await readBody(request); if(!b.name||!b.email||!['Преподаватель','Студент','Администратор'].includes(b.role)) return sendJson(response,400,{error:'Проверьте имя, email и роль'}); const salt=`${b.email}-salt`; const temp=crypto.randomBytes(9).toString('base64url'); try { db.prepare('INSERT INTO accounts (name,email,role,status,last_login,password_hash,password_salt) VALUES (?,?,?,?,?,?,?)').run(String(b.name).trim(),String(b.email).trim().toLowerCase(),b.role,'Ожидает активации','Никогда',hashPassword(temp,salt),salt); } catch(e) { return sendJson(response,409,{error:'Пользователь с таким email уже существует'}); } return sendJson(response,201,{ok:true}); }
-
-    if(request.method==='GET'&&request.url==='/api/teacher/dashboard'){
-      const s=requireRole(request,response,['teacher']); if(!s) return;
-      const profile=db.prepare('SELECT a.name,a.email,p.department,p.position,p.phone FROM accounts a LEFT JOIN teacher_profiles p ON p.account_id=a.id WHERE a.id=?').get(s.accountId);
-      const lessons=db.prepare(`SELECT l.id,l.title,l.group_name AS groupName,l.starts_at AS startsAt,l.ends_at AS endsAt,l.status,c.code AS courseCode,c.name AS courseName FROM lessons l JOIN courses c ON c.id=l.course_id WHERE l.teacher_id=? ORDER BY l.starts_at`).all(s.accountId);
-      return sendJson(response,200,{profile,lessons});
-    }
-    if(request.method==='GET'&&request.url==='/api/student/dashboard'){
-      const s=requireRole(request,response,['student']); if(!s) return;
-      const profile=db.prepare('SELECT a.name,a.email,p.student_number AS studentNumber,p.group_name AS groupName FROM accounts a LEFT JOIN student_profiles p ON p.account_id=a.id WHERE a.id=?').get(s.accountId);
-      const lessons=profile.groupName?db.prepare(`SELECT l.id,l.title,l.starts_at AS startsAt,l.ends_at AS endsAt,l.status,c.code AS courseCode,c.name AS courseName,a.name AS teacherName FROM lessons l JOIN courses c ON c.id=l.course_id JOIN accounts a ON a.id=l.teacher_id WHERE l.group_name=? ORDER BY l.starts_at`).all(profile.groupName):[];
-      return sendJson(response,200,{profile,lessons});
-    }
-    if(request.method==='GET'&&request.url==='/api/courses'){ const s=requireRole(request,response,['admin','teacher','student']); if(!s) return; return sendJson(response,200,db.prepare('SELECT * FROM courses ORDER BY code').all()); }
-
-    if(request.url.startsWith('/api/video/')){
-      const s=requireRole(request,response,['teacher','student']); if(!s) return;
-      if(request.method==='GET'&&request.url==='/api/video/ice-config') return sendJson(response,200,{iceServers:iceServers()});
-      if(request.method==='GET'&&request.url==='/api/video/room') return sendJson(response,200,{...videoRoom,viewer:s.role});
-      if(request.method==='GET'&&request.url==='/api/video/signals') return sendJson(response,200,{messages:videoSignals[s.role].splice(0)});
-      if(request.method==='POST'&&request.url==='/api/video/signals'){ const b=await readBody(request); const target=s.role==='teacher'?'student':'teacher'; if(b.target!==target||!['offer','answer','ice'].includes(b.type)||!b.payload) return sendJson(response,400,{error:'Некорректное WebRTC-сообщение'}); videoSignals[target].push({id:nextSignalId++,from:s.role,type:b.type,payload:b.payload}); return sendJson(response,202,{ok:true}); }
-      if(request.method==='POST'&&request.url==='/api/video/room'){ const b=await readBody(request); if(b.action==='join'){ videoRoom[`${s.role}Joined`]=true; videoRoom.active=true; videoRoom.startedAt ||= Date.now(); videoRoom.revision++; return sendJson(response,200,{...videoRoom,viewer:s.role}); } if(b.action==='leave'){ videoRoom[`${s.role}Joined`]=false; videoRoom.active=videoRoom.teacherJoined||videoRoom.studentJoined; if(!videoRoom.active) videoRoom.startedAt=null; videoRoom.revision++; return sendJson(response,200,{...videoRoom,viewer:s.role}); } return sendJson(response,400,{error:'Неизвестное действие'}); }
-    }
-    return serveStatic(request,response);
-  } catch(error){ console.error(error); return sendJson(response,500,{error:'Внутренняя ошибка сервера'}); }
-});
-server.listen(port,()=>console.log(`EduLink: http://localhost:${port}`));
+const http=require('node:http'),fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto');const{DatabaseSync}=require('node:sqlite');
+const port=Number(process.env.PORT||8000),root=__dirname,sessions=new Map(),db=new DatabaseSync(path.join(root,'edulink.sqlite'));
+db.exec(`CREATE TABLE IF NOT EXISTS accounts(id INTEGER PRIMARY KEY,name TEXT NOT NULL,email TEXT UNIQUE NOT NULL,role TEXT NOT NULL,status TEXT NOT NULL,last_login TEXT NOT NULL,password_hash TEXT NOT NULL,password_salt TEXT NOT NULL);CREATE TABLE IF NOT EXISTS teacher_profiles(account_id INTEGER PRIMARY KEY,department TEXT,position TEXT,phone TEXT,FOREIGN KEY(account_id) REFERENCES accounts(id));CREATE TABLE IF NOT EXISTS student_profiles(account_id INTEGER PRIMARY KEY,student_number TEXT,group_name TEXT,FOREIGN KEY(account_id) REFERENCES accounts(id));CREATE TABLE IF NOT EXISTS courses(id INTEGER PRIMARY KEY,code TEXT UNIQUE NOT NULL,name TEXT NOT NULL,description TEXT);CREATE TABLE IF NOT EXISTS lessons(id INTEGER PRIMARY KEY,course_id INTEGER NOT NULL,teacher_id INTEGER NOT NULL,group_name TEXT NOT NULL,title TEXT NOT NULL,starts_at TEXT NOT NULL,ends_at TEXT NOT NULL,status TEXT NOT NULL,video_room_id TEXT NOT NULL,FOREIGN KEY(course_id) REFERENCES courses(id),FOREIGN KEY(teacher_id) REFERENCES accounts(id));CREATE TABLE IF NOT EXISTS auth_otps(email TEXT NOT NULL,purpose TEXT NOT NULL,otp_hash TEXT NOT NULL,expires_at INTEGER NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(email,purpose));`);
+function ensureColumn(name,def){const cols=db.prepare('PRAGMA table_info(accounts)').all().map(x=>x.name);if(!cols.includes(name))db.exec(`ALTER TABLE accounts ADD COLUMN ${name} ${def}`)}ensureColumn('email_verified','INTEGER NOT NULL DEFAULT 0');ensureColumn('failed_login_attempts','INTEGER NOT NULL DEFAULT 0');ensureColumn('locked_at','INTEGER');
+function hashPassword(p,s){return crypto.scryptSync(p,s,64).toString('hex')}function strongPassword(p){return typeof p==='string'&&p.length>=10&&/[A-Za-zА-Яа-я]/.test(p)&&/\d/.test(p)}function normalizeEmail(v){return String(v||'').trim().toLowerCase()}function validEmail(v){return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)}function safeEqual(a,b){const x=Buffer.from(a),y=Buffer.from(b);return x.length===y.length&&crypto.timingSafeEqual(x,y)}
+function seedAccount(id,name,email,role,password,status='Активен'){const salt=crypto.createHash('sha256').update(email).digest('hex').slice(0,32);db.prepare('INSERT OR IGNORE INTO accounts(id,name,email,role,status,last_login,password_hash,password_salt,email_verified) VALUES(?,?,?,?,?,?,?,?,1)').run(id,name,email,role,status,'Сегодня',hashPassword(password,salt),salt)}
+seedAccount(1,'Анна Крылова','anna.krylova@edulink.local','Преподаватель',process.env.TEACHER_PASSWORD||'TeacherDemo123!');seedAccount(2,'Алексей Морозов',process.env.ADMIN_EMAIL||'admin@edulink.local','Администратор',process.env.ADMIN_PASSWORD||'ChangeMe123!');seedAccount(3,'Елена Смирнова','elena.smirnova@edulink.local','Студент',process.env.STUDENT_PASSWORD||'StudentDemo123!');seedAccount(4,'Мария Волкова','maria.volkova@edulink.local','Преподаватель','TeacherDemo123!');seedAccount(5,'Илья Петров','ilya.petrov@edulink.local','Студент','StudentDemo123!','Ожидает активации');
+db.prepare('INSERT OR IGNORE INTO teacher_profiles(account_id,department,position,phone) VALUES(1,?,?,?)').run('Кафедра терапии','Доцент','+7 (999) 123-45-67');db.prepare('INSERT OR IGNORE INTO student_profiles(account_id,student_number,group_name) VALUES(3,?,?)').run('ST-0003','МЕД-21-01');db.prepare('INSERT OR IGNORE INTO courses(id,code,name,description) VALUES(1,?,?,?)').run('MED101','Основы клинического мышления','Учебный курс с очными и онлайн-занятиями.');db.prepare('INSERT OR IGNORE INTO lessons(id,course_id,teacher_id,group_name,title,starts_at,ends_at,status,video_room_id) VALUES(1,1,1,?,?,?,?,?,?)').run('МЕД-21-01','Разбор клинического случая',new Date(Date.now()+15*60000).toISOString(),new Date(Date.now()+75*60000).toISOString(),'Запланировано','lesson-1');
+const videoRoom={active:false,teacherJoined:false,studentJoined:false,startedAt:null,revision:0},videoSignals={teacher:[],student:[]};let nextSignalId=1;
+function sendJson(r,s,b,h={}){r.writeHead(s,{'Content-Type':'application/json; charset=utf-8',...h});r.end(JSON.stringify(b))}function parseCookies(q){return Object.fromEntries((q.headers.cookie||'').split(';').filter(Boolean).map(x=>x.trim().split('=')))}function currentSession(q){const t=parseCookies(q).edulink_session;return t&&sessions.get(t)}function readBody(q){return new Promise((res,rej)=>{let b='';q.on('data',c=>{b+=c;if(b.length>100000)q.destroy()});q.on('end',()=>{try{res(JSON.parse(b||'{}'))}catch(e){rej(e)}});q.on('error',rej)})}function roleCode(r){return r==='Администратор'?'admin':r==='Преподаватель'?'teacher':r==='Студент'?'student':'staff'}function requireRole(q,r,roles){const s=currentSession(q);if(!s||!roles.includes(s.role)){sendJson(r,403,{error:'Недостаточно прав'});return null}return s}
+function serveStatic(q,r){const u=q.url.split('?')[0],req=u==='/'?'/index.html':u,f=path.normalize(path.join(root,req));if(!f.startsWith(root)||!fs.existsSync(f)||fs.statSync(f).isDirectory())return sendJson(r,404,{error:'Не найдено'});const t={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8'};r.writeHead(200,{'Content-Type':t[path.extname(f)]||'application/octet-stream'});fs.createReadStream(f).pipe(r)}
+function iceServers(){const s=String(process.env.STUN_URLS||'stun:stun.l.google.com:19302').split(',').map(v=>v.trim()).filter(Boolean),a=[{urls:s.length===1?s[0]:s}],t=String(process.env.TURN_URLS||process.env.TURN_URL||'').split(',').map(v=>v.trim()).filter(Boolean);if(t.length)a.push({urls:t.length===1?t[0]:t,username:process.env.TURN_USERNAME||'',credential:process.env.TURN_CREDENTIAL||''});return a}
+async function sendOtp(email,otp,purpose){const apiKey=process.env.RESEND_API_KEY,from=process.env.EMAIL_FROM;if(!apiKey||!from){if(process.env.ALLOW_DEV_OTP==='true'){console.log(`[DEV OTP] ${email} ${purpose}: ${otp}`);return{devOtp:otp}}throw new Error('Сервис отправки e-mail не настроен')}const title=purpose==='register'?'Подтверждение регистрации EduLink':'Восстановление пароля EduLink',html=`<p>Ваш одноразовый код EduLink:</p><p style="font-size:28px;font-weight:bold;letter-spacing:4px">${otp}</p><p>Код действует 10 минут. Никому его не сообщайте.</p>`;const resp=await fetch('https://api.resend.com/emails',{method:'POST',headers:{Authorization:`Bearer ${apiKey}`,'Content-Type':'application/json'},body:JSON.stringify({from,to:[email],subject:title,html})});if(!resp.ok)throw new Error('Не удалось отправить e-mail');return{}}
+async function issueOtp(email,purpose){const otp=String(crypto.randomInt(100000,1000000)),hash=crypto.createHash('sha256').update(`${email}:${purpose}:${otp}`).digest('hex');db.prepare('INSERT INTO auth_otps(email,purpose,otp_hash,expires_at,attempts) VALUES(?,?,?,?,0) ON CONFLICT(email,purpose) DO UPDATE SET otp_hash=excluded.otp_hash,expires_at=excluded.expires_at,attempts=0').run(email,purpose,hash,Date.now()+10*60000);return{otp,...await sendOtp(email,otp,purpose)}}
+function verifyOtp(email,purpose,otp){const row=db.prepare('SELECT * FROM auth_otps WHERE email=? AND purpose=?').get(email,purpose);if(!row||Date.now()>row.expires_at){db.prepare('DELETE FROM auth_otps WHERE email=? AND purpose=?').run(email,purpose);return false}if(row.attempts>=5)return false;const hash=crypto.createHash('sha256').update(`${email}:${purpose}:${otp}`).digest('hex');if(!safeEqual(hash,row.otp_hash)){db.prepare('UPDATE auth_otps SET attempts=attempts+1 WHERE email=? AND purpose=?').run(email,purpose);return false}db.prepare('DELETE FROM auth_otps WHERE email=? AND purpose=?').run(email,purpose);return true}
+const server=http.createServer(async(q,r)=>{try{
+if(q.method==='POST'&&q.url==='/api/register/request-otp'){const b=await readBody(q),email=normalizeEmail(b.email),name=String(b.name||'').trim(),password=String(b.password||'');if(name.length<2||!validEmail(email)||!strongPassword(password))return sendJson(r,400,{error:'Укажите имя, корректный e-mail и пароль не короче 10 символов с буквами и цифрами'});const ex=db.prepare('SELECT * FROM accounts WHERE lower(email)=?').get(email);if(ex&&ex.email_verified)return sendJson(r,409,{error:'Учетная запись с таким e-mail уже существует'});const salt=crypto.randomBytes(16).toString('hex');if(ex)db.prepare('UPDATE accounts SET name=?,role=?,status=?,password_hash=?,password_salt=?,email_verified=0,failed_login_attempts=0,locked_at=NULL WHERE id=?').run(name,'Студент','Ожидает активации',hashPassword(password,salt),salt,ex.id);else db.prepare('INSERT INTO accounts(name,email,role,status,last_login,password_hash,password_salt,email_verified) VALUES(?,?,?,?,?,?,?,0)').run(name,email,'Студент','Ожидает активации','Никогда',hashPassword(password,salt),salt);const out=await issueOtp(email,'register');return sendJson(r,200,{ok:true,expiresIn:600,...(out.devOtp?{devOtp:out.devOtp}:{})})}
+if(q.method==='POST'&&q.url==='/api/register/verify'){const b=await readBody(q),email=normalizeEmail(b.email);if(!verifyOtp(email,'register',String(b.otp||'')))return sendJson(r,400,{error:'Неверный или просроченный код'});const a=db.prepare('SELECT id FROM accounts WHERE lower(email)=?').get(email);if(!a)return sendJson(r,404,{error:'Регистрация не найдена'});db.prepare('UPDATE accounts SET status=?,email_verified=1 WHERE id=?').run('Активен',a.id);db.prepare('INSERT OR IGNORE INTO student_profiles(account_id,student_number,group_name) VALUES(?,?,?)').run(a.id,`ST-${String(a.id).padStart(4,'0')}`,null);return sendJson(r,200,{ok:true})}
+if(q.method==='POST'&&q.url==='/api/password/request-reset'){const b=await readBody(q),email=normalizeEmail(b.email),a=db.prepare('SELECT * FROM accounts WHERE lower(email)=?').get(email);if(a&&a.email_verified)await issueOtp(email,'reset');return sendJson(r,200,{ok:true})}
+if(q.method==='POST'&&q.url==='/api/password/reset'){const b=await readBody(q),email=normalizeEmail(b.email),password=String(b.password||'');if(!strongPassword(password))return sendJson(r,400,{error:'Новый пароль должен содержать не менее 10 символов, буквы и цифры'});if(!verifyOtp(email,'reset',String(b.otp||'')))return sendJson(r,400,{error:'Неверный или просроченный код'});const a=db.prepare('SELECT id FROM accounts WHERE lower(email)=?').get(email);if(!a)return sendJson(r,400,{error:'Не удалось изменить пароль'});const salt=crypto.randomBytes(16).toString('hex');db.prepare('UPDATE accounts SET password_hash=?,password_salt=?,failed_login_attempts=0,locked_at=NULL,status=CASE WHEN email_verified=1 THEN ? ELSE status END WHERE id=?').run(hashPassword(password,salt),salt,'Активен',a.id);return sendJson(r,200,{ok:true})}
+if(q.method==='POST'&&q.url==='/api/account/password'){const s=currentSession(q);if(!s)return sendJson(r,401,{error:'Требуется авторизация'});const b=await readBody(q),a=db.prepare('SELECT * FROM accounts WHERE id=?').get(s.accountId),old=String(b.currentPassword||''),next=String(b.newPassword||'');if(!safeEqual(hashPassword(old,a.password_salt),a.password_hash))return sendJson(r,400,{error:'Текущий пароль указан неверно'});if(!strongPassword(next))return sendJson(r,400,{error:'Новый пароль должен содержать не менее 10 символов, буквы и цифры'});const salt=crypto.randomBytes(16).toString('hex');db.prepare('UPDATE accounts SET password_hash=?,password_salt=? WHERE id=?').run(hashPassword(next,salt),salt,a.id);for(const[token,ss]of sessions)if(ss.accountId===a.id&&token!==parseCookies(q).edulink_session)sessions.delete(token);return sendJson(r,200,{ok:true})}
+if(q.method==='POST'&&q.url==='/api/login'){const b=await readBody(q),email=normalizeEmail(b.email),a=db.prepare('SELECT * FROM accounts WHERE lower(email)=?').get(email);if(!a)return sendJson(r,401,{error:'Неверный e-mail или пароль'});if(a.status==='Заблокирован'||a.locked_at)return sendJson(r,423,{error:'Учетная запись заблокирована. Восстановите пароль или обратитесь к администратору'});if(!a.email_verified)return sendJson(r,403,{error:'Сначала подтвердите e-mail'});if(!safeEqual(hashPassword(String(b.password||''),a.password_salt),a.password_hash)){const n=(a.failed_login_attempts||0)+1;if(n>=3){db.prepare('UPDATE accounts SET failed_login_attempts=?,locked_at=?,status=? WHERE id=?').run(n,Date.now(),'Заблокирован',a.id);return sendJson(r,423,{error:'Учетная запись заблокирована после 3 неверных попыток входа'})}db.prepare('UPDATE accounts SET failed_login_attempts=? WHERE id=?').run(n,a.id);return sendJson(r,401,{error:`Неверный e-mail или пароль. Осталось попыток: ${3-n}`})}db.prepare('UPDATE accounts SET failed_login_attempts=0,locked_at=NULL,last_login=? WHERE id=?').run(new Date().toISOString(),a.id);const token=crypto.randomBytes(32).toString('hex'),role=roleCode(a.role);sessions.set(token,{accountId:a.id,email:a.email,role});return sendJson(r,200,{email:a.email,role},{'Set-Cookie':`edulink_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=28800${process.env.NODE_ENV==='production'?'; Secure':''}`})}
+if(q.method==='POST'&&q.url==='/api/logout'){const t=parseCookies(q).edulink_session;if(t)sessions.delete(t);return sendJson(r,200,{ok:true},{'Set-Cookie':'edulink_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0'})}if(q.method==='GET'&&q.url==='/api/session'){const s=currentSession(q);return s?sendJson(r,200,{email:s.email,role:s.role}):sendJson(r,401,{error:'Требуется авторизация'})}
+if(q.method==='GET'&&q.url==='/api/users'){if(!requireRole(q,r,['admin']))return;return sendJson(r,200,db.prepare('SELECT id,name,email,role,status,last_login AS lastLogin,email_verified AS emailVerified,failed_login_attempts AS failedLoginAttempts FROM accounts ORDER BY id').all())}if(q.method==='POST'&&q.url==='/api/users'){if(!requireRole(q,r,['admin']))return;const b=await readBody(q);if(!b.name||!validEmail(normalizeEmail(b.email))||!['Преподаватель','Студент','Администратор'].includes(b.role))return sendJson(r,400,{error:'Проверьте имя, e-mail и роль'});const email=normalizeEmail(b.email),salt=crypto.randomBytes(16).toString('hex'),temp=crypto.randomBytes(9).toString('base64url')+'7';try{db.prepare('INSERT INTO accounts(name,email,role,status,last_login,password_hash,password_salt,email_verified) VALUES(?,?,?,?,?,?,?,0)').run(String(b.name).trim(),email,b.role,'Ожидает активации','Никогда',hashPassword(temp,salt),salt)}catch(e){return sendJson(r,409,{error:'Пользователь с таким e-mail уже существует'})}return sendJson(r,201,{ok:true})}
+const unlock=q.url.match(/^\/api\/users\/(\d+)\/unlock$/);if(q.method==='POST'&&unlock){if(!requireRole(q,r,['admin']))return;db.prepare('UPDATE accounts SET status=?,failed_login_attempts=0,locked_at=NULL WHERE id=?').run('Активен',Number(unlock[1]));return sendJson(r,200,{ok:true})}
+if(q.method==='GET'&&q.url==='/api/teacher/dashboard'){const s=requireRole(q,r,['teacher']);if(!s)return;const profile=db.prepare('SELECT a.name,a.email,p.department,p.position,p.phone FROM accounts a LEFT JOIN teacher_profiles p ON p.account_id=a.id WHERE a.id=?').get(s.accountId),lessons=db.prepare(`SELECT l.id,l.title,l.group_name AS groupName,l.starts_at AS startsAt,l.ends_at AS endsAt,l.status,c.code AS courseCode,c.name AS courseName FROM lessons l JOIN courses c ON c.id=l.course_id WHERE l.teacher_id=? ORDER BY l.starts_at`).all(s.accountId);return sendJson(r,200,{profile,lessons})}if(q.method==='GET'&&q.url==='/api/student/dashboard'){const s=requireRole(q,r,['student']);if(!s)return;const profile=db.prepare('SELECT a.name,a.email,p.student_number AS studentNumber,p.group_name AS groupName FROM accounts a LEFT JOIN student_profiles p ON p.account_id=a.id WHERE a.id=?').get(s.accountId),lessons=profile.groupName?db.prepare(`SELECT l.id,l.title,l.starts_at AS startsAt,l.ends_at AS endsAt,l.status,c.code AS courseCode,c.name AS courseName,a.name AS teacherName FROM lessons l JOIN courses c ON c.id=l.course_id JOIN accounts a ON a.id=l.teacher_id WHERE l.group_name=? ORDER BY l.starts_at`).all(profile.groupName):[];return sendJson(r,200,{profile,lessons})}if(q.method==='GET'&&q.url==='/api/courses'){if(!requireRole(q,r,['admin','teacher','student']))return;return sendJson(r,200,db.prepare('SELECT * FROM courses ORDER BY code').all())}
+if(q.url.startsWith('/api/video/')){const s=requireRole(q,r,['teacher','student']);if(!s)return;if(q.method==='GET'&&q.url==='/api/video/ice-config')return sendJson(r,200,{iceServers:iceServers()});if(q.method==='GET'&&q.url==='/api/video/room')return sendJson(r,200,{...videoRoom,viewer:s.role});if(q.method==='GET'&&q.url==='/api/video/signals')return sendJson(r,200,{messages:videoSignals[s.role].splice(0)});if(q.method==='POST'&&q.url==='/api/video/signals'){const b=await readBody(q),target=s.role==='teacher'?'student':'teacher';if(b.target!==target||!['offer','answer','ice'].includes(b.type)||!b.payload)return sendJson(r,400,{error:'Некорректное WebRTC-сообщение'});videoSignals[target].push({id:nextSignalId++,from:s.role,type:b.type,payload:b.payload});return sendJson(r,202,{ok:true})}if(q.method==='POST'&&q.url==='/api/video/room'){const b=await readBody(q);if(b.action==='join'){videoRoom[`${s.role}Joined`]=true;videoRoom.active=true;videoRoom.startedAt||=Date.now();videoRoom.revision++;return sendJson(r,200,{...videoRoom,viewer:s.role})}if(b.action==='leave'){videoRoom[`${s.role}Joined`]=false;videoRoom.active=videoRoom.teacherJoined||videoRoom.studentJoined;if(!videoRoom.active)videoRoom.startedAt=null;videoRoom.revision++;return sendJson(r,200,{...videoRoom,viewer:s.role})}return sendJson(r,400,{error:'Неизвестное действие'})}}
+return serveStatic(q,r)}catch(e){console.error(e);return sendJson(r,500,{error:e.message==='Сервис отправки e-mail не настроен'?e.message:'Внутренняя ошибка сервера'})}});server.listen(port,()=>console.log(`EduLink: http://localhost:${port}`));
