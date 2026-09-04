@@ -1,0 +1,5 @@
+edulink.sqlite
+edulink.sqlite-shm
+edulink.sqlite-wal
+node_modules/
+.env
