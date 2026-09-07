@@ -174,26 +174,7 @@ function iceServers() {
   return result;
 }
 
-async function sendOtp(email, otp, purpose) {
-  const apiKey = process.env.RESEND_API_KEY;
-  const from = process.env.EMAIL_FROM;
-  if (!apiKey || !from) {
-    if (process.env.ALLOW_DEV_OTP === 'true') {
-      console.log(`[DEV OTP] ${email} ${purpose}: ${otp}`);
-      return { devOtp: otp };
-    }
-    throw new Error('Сервис отправки e-mail не настроен');
-  }
-  const title = purpose === 'register' ? 'Подтверждение регистрации EduLink' : 'Восстановление пароля EduLink';
-  const html = `<p>Ваш одноразовый код EduLink:</p><p style="font-size:28px;font-weight:bold;letter-spacing:4px">${otp}</p><p>Код действует 10 минут. Никому его не сообщайте.</p>`;
-  const response = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ from, to: [email], subject: title, html })
-  });
-  if (!response.ok) throw new Error('Не удалось отправить e-mail');
-  return {};
-}
+const { sendOtp } = require('./mailer');
 async function issueOtp(email, purpose) {
   const otp = String(crypto.randomInt(100000, 1000000));
   const hash = crypto.createHash('sha256').update(`${email}:${purpose}:${otp}`).digest('hex');

@@ -34,7 +34,7 @@ function requireRole(request, response, roles) {
 function readBody(request) {
   return new Promise((resolve, reject) => {
     let body = '';
-    request.on('data', (chunk) => { body += chunk; if (body.length > 200000) request.destroy(); });
+    request.on('data', (chunk) => { body += chunk; if (body.length > (request.url.startsWith('/api/learning/') ? 800000 : 200000)) request.destroy(); });
     request.on('end', () => { try { resolve(JSON.parse(body || '{}')); } catch (error) { reject(error); } });
     request.on('error', reject);
   });
@@ -42,6 +42,8 @@ function readBody(request) {
 function serveStatic(request, response) {
   const url = request.url.split('?')[0];
   const requested = url === '/' ? '/index.html' : url;
+  const publicFiles = new Set(['/index.html', '/student.html', '/teacher.html', '/video.html', '/app.js', '/account.js', '/admin-academics.js', '/student.js', '/teacher.js', '/video.js', '/styles.css', '/collab.css', '/patient-video.css', '/admin-schedule.js', '/learning.html', '/learning-ui.js', '/learning.css', '/journal.html', '/journal-ui.js']);
+  if (!publicFiles.has(requested)) return sendJson(response, 404, { error: 'Not found' });
   const filePath = path.normalize(path.join(root, requested));
   if (!filePath.startsWith(root) || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) return sendJson(response, 404, { error: 'Не найдено' });
   const ext = path.extname(filePath);
@@ -59,23 +61,7 @@ function iceServers() {
   return result;
 }
 
-async function sendOtp(email, otp, purpose) {
-  const apiKey = process.env.RESEND_API_KEY;
-  const from = process.env.EMAIL_FROM;
-  if (!apiKey || !from) {
-    if (process.env.ALLOW_DEV_OTP === 'true') { console.log(`[DEV OTP] ${email} ${purpose}: ${otp}`); return { devOtp: otp }; }
-    throw new Error('Сервис отправки e-mail не настроен');
-  }
-  const title = purpose === 'register' ? 'Подтверждение регистрации EduLink' : 'Восстановление пароля EduLink';
-  const html = `<p>Ваш одноразовый код EduLink:</p><p style="font-size:28px;font-weight:bold;letter-spacing:4px">${otp}</p><p>Код действует 10 минут. Никому его не сообщайте.</p>`;
-  const result = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json', 'User-Agent': 'EduLink/1.0' },
-    body: JSON.stringify({ from, to: [email], subject: title, html })
-  });
-  if (!result.ok) { console.error('Resend error', result.status, await result.text()); throw new Error('Не удалось отправить e-mail'); }
-  return {};
-}
+const { sendOtp } = require('./mailer');
 async function issueOtp(email, purpose) {
   const otp = String(crypto.randomInt(100000, 1000000));
   const hash = crypto.createHash('sha256').update(`${email}:${purpose}:${otp}`).digest('hex');
@@ -116,6 +102,12 @@ async function validateTeacher(id) {
 const videoRoom = { active: false, teacherJoined: false, studentJoined: false, startedAt: null, revision: 0 };
 const videoSignals = { teacher: [], student: [] };
 let nextSignalId = 1;
+
+const journal = require('./journal');
+const journalHandler = journal.create({ transaction, currentSession, readBody, sendJson });
+const learning = require('./learning');
+const learningHandler = learning.create({ query, transaction, currentSession, readBody, sendJson });
+const scheduleHandler = require('./schedule-api')({ transaction, many, requireRole, readBody, sendJson });
 
 const server = http.createServer(async (request, response) => {
   try {
@@ -302,6 +294,10 @@ const server = http.createServer(async (request, response) => {
       const account = await one('SELECT email FROM accounts WHERE id=$1', [id]);
       if (!account) return sendJson(response, 404, { error: 'Пользователь не найден' });
       const lessonCount = await one('SELECT COUNT(*)::int AS count FROM lessons WHERE teacher_id=$1', [id]);
+      const markCount = await one('SELECT COUNT(*)::int AS count FROM lesson_marks WHERE student_id=$1', [id]);
+      if (markCount.count) return sendJson(response, 409, { error: 'У студента есть оценки в журнале. Вместо удаления можно заблокировать учётную запись.' });
+      const attemptCount = await one('SELECT COUNT(*)::int AS count FROM test_attempts WHERE student_id=$1', [id]);
+      if (attemptCount.count) return sendJson(response, 409, { error: 'У студента есть результаты тестирования. Вместо удаления можно заблокировать учётную запись.' });
       const courseCount = await one('SELECT COUNT(*)::int AS count FROM courses WHERE teacher_id=$1', [id]);
       if (lessonCount.count || courseCount.count) return sendJson(response, 409, { error: 'Нельзя удалить преподавателя, пока на него назначены дисциплины или занятия.' });
       await transaction(async (client) => { await client.query('DELETE FROM auth_otps WHERE lower(email)=lower($1)', [account.email]); await client.query('DELETE FROM accounts WHERE id=$1', [id]); });
@@ -404,6 +400,10 @@ const server = http.createServer(async (request, response) => {
       return sendJson(response, 200, { ok: true });
     }
 
+    if (await journalHandler(request, response)) return;
+    if (await learningHandler(request, response)) return;
+    if (await scheduleHandler(request, response)) return;
+
     if (request.method === 'GET' && request.url === '/api/teacher/dashboard') {
       const session = requireRole(request, response, ['teacher']); if (!session) return;
       const profile = await one(`SELECT a.name,a.email,p.department,p.position,p.phone FROM accounts a LEFT JOIN teacher_profiles p ON p.account_id=a.id WHERE a.id=$1`, [session.accountId]);
@@ -455,8 +455,10 @@ const server = http.createServer(async (request, response) => {
   }
 });
 
-initDb().then(() => {
-  server.listen(port, () => console.log(`EduLink PostgreSQL: http://localhost:${port}`));
+initDb().then(() => learning.init(query)).then(() => journal.init(query)).then(() => {
+  learning.expire({ query }).catch(error => console.error('Attempt expiry:', error.code));
+  setInterval(() => learning.expire({ query }).catch(error => console.error('Attempt expiry:', error.code)), 2000).unref();
+  server.listen(port, process.env.HOST || '127.0.0.1', () => console.log(`EduLink PostgreSQL: http://localhost:${port}`));
 }).catch((error) => {
   console.error('PostgreSQL initialization failed:', error);
   process.exit(1);
