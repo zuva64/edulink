@@ -25,6 +25,47 @@
     <div class="catalog-table-wrap"><table><thead><tr><th>ДАТА И ВРЕМЯ</th><th>ЗАНЯТИЕ</th><th>ПРЕПОДАВАТЕЛЬ</th><th>ГРУППА</th><th>СТАТУС</th><th>ДЕЙСТВИЯ</th></tr></thead><tbody id="lessonTable"></tbody></table></div>
     <div class="catalog-empty" id="lessonEmpty" hidden>Занятия не найдены. Измените фильтры или создайте новое занятие.</div></section>`;
   main.appendChild(view);
+  const calendarStyle = document.createElement('style');
+  calendarStyle.textContent = '.schedule-calendar-tools{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:16px 20px}.schedule-calendar-tools button,.schedule-calendar-tools input{padding:8px;border:1px solid #d5ddd8;border-radius:8px;background:white}.schedule-calendar-tools button{cursor:pointer}.schedule-calendar-tools button[aria-pressed="true"]{background:#174b39;color:white}.schedule-week{display:grid;grid-template-columns:repeat(7,minmax(145px,1fr));gap:8px;padding:12px;min-width:1080px}.schedule-day{background:#f6f8f7;border-radius:10px;padding:8px;min-height:240px}.schedule-day h3{font-size:13px;margin:4px 0 14px}.schedule-day.today{outline:2px solid #28765a;outline-offset:-2px}.schedule-event{display:block;width:100%;text-align:left;border:1px solid #cddfd5;border-left:4px solid #28765a;background:white;border-radius:8px;padding:10px;margin-bottom:8px;cursor:pointer;overflow-wrap:anywhere}.schedule-event span{display:block;font-size:11px;margin-top:5px;color:#526459}.schedule-event.cancelled{opacity:.65;border-left-color:#999}.schedule-event:focus-visible{outline:3px solid #2679b9}.schedule-calendar-scroll{overflow-x:auto}';
+  document.head.appendChild(calendarStyle);
+  const tableWrap = view.querySelector('.catalog-table-wrap');
+  const calendarTools = document.createElement('div');
+  calendarTools.className = 'schedule-calendar-tools';
+  calendarTools.innerHTML = '<button type="button" data-mode="list" aria-pressed="true">Список</button><button type="button" data-mode="calendar" aria-pressed="false">Календарь</button><span class="week-controls" hidden><button type="button" data-week="-1" aria-label="Предыдущая неделя">←</button> <button type="button" data-week="0">Сегодня</button> <button type="button" data-week="1" aria-label="Следующая неделя">→</button> <label>Перейти к дате <input type="date" id="calendarDate"></label></span><strong id="calendarRange" aria-live="polite"></strong>';
+  tableWrap.before(calendarTools);
+  const calendar = document.createElement('div');
+  calendar.className = 'schedule-calendar-scroll'; calendar.hidden = true;
+  tableWrap.after(calendar);
+  let calendarMode = false, calendarDay = new Date();
+  const dayKey = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  function renderCalendar() {
+    tableWrap.hidden = calendarMode;
+    calendar.hidden = !calendarMode;
+    calendarTools.querySelector('.week-controls').hidden = !calendarMode;
+    calendarTools.querySelectorAll('[data-mode]').forEach(b => b.setAttribute('aria-pressed', String((b.dataset.mode === 'calendar') === calendarMode)));
+    const range = calendarTools.querySelector('#calendarRange');
+    range.textContent = '';
+    if (!calendarMode) return;
+    const start = new Date(calendarDay); start.setHours(0,0,0,0); start.setDate(start.getDate() - (start.getDay()+6)%7);
+    const finish = new Date(start); finish.setDate(finish.getDate()+6);
+    range.textContent = `${start.toLocaleDateString('ru-RU')} — ${finish.toLocaleDateString('ru-RU')}`;
+    calendarTools.querySelector('#calendarDate').value = dayKey(calendarDay);
+    const time = v => new Date(v).toLocaleTimeString('ru-RU', {hour:'2-digit',minute:'2-digit'});
+    calendar.innerHTML = '<div class="schedule-week">' + Array.from({length:7},(_,i)=>{
+      const day = new Date(start); day.setDate(day.getDate()+i);
+      const next = new Date(day); next.setDate(next.getDate()+1);
+      const events = lessons.filter(l => new Date(l.startsAt)<next && new Date(l.endsAt)>day).sort((a,b)=>new Date(a.startsAt)-new Date(b.startsAt));
+      return `<section class="schedule-day ${dayKey(day)===dayKey(new Date())?'today':''}"><h3>${esc(day.toLocaleDateString('ru-RU',{weekday:'short',day:'numeric',month:'short'}))}</h3>${events.length ? events.map(l=>`<button type="button" class="schedule-event ${l.status==='Отменено'?'cancelled':''}" data-id="${esc(l.id)}"><strong>${esc(time(l.startsAt))}–${esc(time(l.endsAt))}</strong><span>${esc(l.title)}</span><span>${esc(l.courseName)}</span><span>${esc(l.groupName)} · ${esc(l.teacherName)}</span><span>${esc(l.status)}</span></button>`).join('') : '<p class="meta">Нет занятий</p>'}</section>`;
+    }).join('') + '</div>';
+  }
+  calendarTools.onclick = e => {
+    const mode = e.target.closest('[data-mode]'), week = e.target.closest('[data-week]');
+    if (mode) calendarMode = mode.dataset.mode === 'calendar';
+    if (week) { const offset = Number(week.dataset.week); if (!offset) calendarDay = new Date(); else calendarDay.setDate(calendarDay.getDate()+offset*7); }
+    renderCalendar();
+  };
+  calendarTools.querySelector('#calendarDate').onchange = e => { if (e.target.value) { calendarDay = new Date(e.target.value+'T12:00:00'); renderCalendar(); } };
+  calendar.onclick = e => { const button = e.target.closest('[data-id]'); if (button) edit(lessons.find(l => String(l.id)===button.dataset.id)); };
   const modal = document.createElement('dialog');
   modal.className = 'catalog-modal'; modal.style.border = '1px solid #d5ddd8';
   document.body.appendChild(modal);
@@ -57,6 +98,7 @@
       const result = await api('/api/admin/lessons?' + params);
       if (version !== requestVersion) return;
       lessons = result;
+      renderCalendar();
       view.querySelector('#lessonCount').textContent = `Найдено занятий: ${lessons.length}`;
       view.querySelector('#lessonEmpty').hidden = lessons.length > 0;
       view.querySelector('#lessonTable').innerHTML = lessons.map(l => `<tr><td>${esc(fmt(l.startsAt))}<span class="catalog-desc">до ${esc(fmt(l.endsAt))}</span></td><td><strong>${esc(l.title)}</strong><span class="catalog-desc">${esc(l.courseCode)} · ${esc(l.courseName)}</span></td><td>${esc(l.teacherName)}</td><td>${esc(l.groupName)}</td><td><span class="catalog-status ${l.status === 'Отменено' ? 'archived' : ''}">${esc(l.status)}</span></td><td><div class="catalog-actions"><button class="catalog-button" data-action="edit" data-id="${l.id}">Редактировать</button><button class="catalog-button" data-action="copy" data-id="${l.id}">Копировать</button>${l.status === 'Запланировано' ? `<button class="catalog-button" data-action="complete" data-id="${l.id}">Проведено</button><button class="catalog-button" data-action="cancel" data-id="${l.id}">Отменить занятие</button>` : ''}<button class="catalog-button danger" data-action="delete" data-id="${l.id}">Удалить</button></div></td></tr>`).join('');
