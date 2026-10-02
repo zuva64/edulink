@@ -120,3 +120,5 @@ Docker на машине подготовки не установлен: кон�
 Официальная документация: https://docs.docker.com/compose/how-tos/startup-order/ и https://docs.docker.com/guides/postgresql/
 
 ## added github runner
+
+## test
